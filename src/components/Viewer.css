@@ -1,0 +1,51 @@
+.viewer-container {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 20px;
+    font-family: Arial, sans-serif;
+  }
+  
+  .stream-info {
+    background-color: #f5f5f5;
+    padding: 15px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+  }
+  
+  .highlight {
+    font-weight: bold;
+  }
+  
+  .connected {
+    color: #27ae60;
+  }
+  
+  .disconnected {
+    color: #e74c3c;
+  }
+  
+  .stream-container {
+    margin-bottom: 20px;
+    background-color: #000;
+    border-radius: 8px;
+    height: 360px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+  
+  .stream-frame {
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 8px;
+  }
+  
+  .controls button {
+    padding: 10px 20px;
+    background-color: #3498db;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+  }
