@@ -6,17 +6,13 @@ const Broadcaster = () => {
   const [isStreaming, setIsStreaming] = useState(false);
   const [status, setStatus] = useState('Ready to stream');
   const [viewerCount, setViewerCount] = useState(0);
-  const [fps, setFps] = useState(10); // Frames per second
-  const [quality, setQuality] = useState(0.7); // JPEG quality (0-1)
   const [resolution, setResolution] = useState('640x480');
   
   const videoRef = useRef(null);
-  const canvasRef = useRef(null);
-  const streamRef = useRef(null);
   const socketRef = useRef(null);
-  const frameIntervalRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const peerConnectionsRef = useRef({});
   const broadcasterId = useRef(`broadcaster_${Math.random().toString(36).substring(2, 15)}`);
-  const viewers = useRef(new Set());
 
   // Fetch a new stream ID when component mounts
   useEffect(() => {
@@ -44,41 +40,98 @@ const Broadcaster = () => {
   const startStreaming = async () => {
     try {
       // Get video stream from camera
-      streamRef.current = await navigator.mediaDevices.getUserMedia({ 
-        video: getResolutionConstraints(), 
-        audio: false 
+      const [width, height] = resolution.split('x').map(Number);
+      
+      localStreamRef.current = await navigator.mediaDevices.getUserMedia({ 
+        video: { 
+          width: { ideal: width },
+          height: { ideal: height }
+        }, 
+        audio: true  // Enable audio for WebRTC
       });
       
       // Set the video source
       if (videoRef.current) {
-        videoRef.current.srcObject = streamRef.current;
+        videoRef.current.srcObject = localStreamRef.current;
       }
       
-      // Setup WebSocket connection
-      socketRef.current = new WebSocket(`ws://localhost:8000/ws/broadcast/${streamId}/`);
+      // Setup WebSocket connection for signaling
+      socketRef.current = new WebSocket(`ws://localhost:8000/ws/webrtc/${streamId}/`);
       
       socketRef.current.onopen = () => {
-        console.log('WebSocket connection established for broadcasting');
-        setStatus('Connected to server, streaming active');
+        console.log('WebRTC signaling connection established');
+        setStatus('Connected to signaling server, waiting for viewers');
         setIsStreaming(true);
         
-        // Start sending frames once the connection is established
-        startSendingFrames();
+        // Announce presence as broadcaster
+        socketRef.current.send(JSON.stringify({
+          type: 'broadcaster_ready',
+          broadcasterId: broadcasterId.current
+        }));
       };
       
-      socketRef.current.onmessage = (event) => {
+      socketRef.current.onmessage = async (event) => {
         try {
-          const data = JSON.parse(event.data);
+          const message = JSON.parse(event.data);
           
-          if (data.type === 'viewer_update') {
-            if (data.action === 'joined') {
-              console.log(`Viewer joined: ${data.viewer_id}`);
-              viewers.current.add(data.viewer_id);
-              setViewerCount(viewers.current.size);
-            } else if (data.action === 'left') {
-              console.log(`Viewer left: ${data.viewer_id}`);
-              viewers.current.delete(data.viewer_id);
-              setViewerCount(viewers.current.size);
+          if (message.type === 'viewer_joined') {
+            const viewerId = message.viewerId;
+            console.log(`New viewer joined: ${viewerId}`);
+            
+            // Create a new RTCPeerConnection for this viewer
+            const peerConnection = createPeerConnection(viewerId);
+            
+            // Add tracks from local stream to the peer connection
+            localStreamRef.current.getTracks().forEach(track => {
+              peerConnection.addTrack(track, localStreamRef.current);
+            });
+            
+            // Create and send an offer to the viewer
+            try {
+              const offer = await peerConnection.createOffer();
+              await peerConnection.setLocalDescription(offer);
+              
+              socketRef.current.send(JSON.stringify({
+                type: 'offer',
+                offer: offer,
+                viewerId: viewerId,
+                broadcasterId: broadcasterId.current
+              }));
+            } catch (error) {
+              console.error('Error creating offer:', error);
+            }
+            
+            // Update viewer count
+            setViewerCount(prevCount => prevCount + 1);
+          }
+          else if (message.type === 'answer' && message.broadcasterId === broadcasterId.current) {
+            const viewerId = message.viewerId;
+            const peerConnection = peerConnectionsRef.current[viewerId];
+            
+            if (peerConnection && peerConnection.signalingState !== 'closed') {
+              await peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+              console.log(`Processed answer from viewer: ${viewerId}`);
+            }
+          }
+          else if (message.type === 'ice_candidate' && message.broadcasterId === broadcasterId.current) {
+            const viewerId = message.viewerId;
+            const peerConnection = peerConnectionsRef.current[viewerId];
+            
+            if (peerConnection && peerConnection.signalingState !== 'closed') {
+              await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+            }
+          }
+          else if (message.type === 'viewer_left') {
+            const viewerId = message.viewerId;
+            
+            // Clean up the peer connection
+            if (peerConnectionsRef.current[viewerId]) {
+              peerConnectionsRef.current[viewerId].close();
+              delete peerConnectionsRef.current[viewerId];
+              
+              // Update viewer count
+              setViewerCount(prevCount => Math.max(0, prevCount - 1));
+              console.log(`Viewer left: ${viewerId}`);
             }
           }
         } catch (error) {
@@ -88,14 +141,16 @@ const Broadcaster = () => {
       
       socketRef.current.onclose = (event) => {
         console.log(`WebSocket connection closed: ${event.code}`);
-        setStatus('Connection closed');
-        setIsStreaming(false);
-        stopSendingFrames();
+        setStatus('Signaling connection closed');
+        
+        if (isStreaming) {
+          stopStreaming();
+        }
       };
       
       socketRef.current.onerror = (error) => {
         console.error('WebSocket error:', error);
-        setStatus('Connection error');
+        setStatus('Signaling connection error');
       };
     } catch (error) {
       console.error('Error starting stream:', error);
@@ -103,10 +158,73 @@ const Broadcaster = () => {
     }
   };
   
+  // Create a new RTCPeerConnection for a viewer
+  const createPeerConnection = (viewerId) => {
+    // Configure ICE servers (STUN/TURN)
+    const configuration = {
+      iceServers: [
+        { 
+          urls: 'stun:stun.l.google.com:19302' 
+        },
+        // Add TURN servers for better NAT traversal in production
+        // {
+        //   urls: 'turn:your-turn-server.com:3478',
+        //   username: 'username',
+        //   credential: 'password'
+        // }
+      ]
+    };
+    
+    const peerConnection = new RTCPeerConnection(configuration);
+    
+    // Store the connection
+    peerConnectionsRef.current[viewerId] = peerConnection;
+    
+    // Handle ICE candidates
+    peerConnection.onicecandidate = (event) => {
+      if (event.candidate && socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+        socketRef.current.send(JSON.stringify({
+          type: 'ice_candidate',
+          candidate: event.candidate,
+          viewerId: viewerId,
+          broadcasterId: broadcasterId.current
+        }));
+      }
+    };
+    
+    // Log state changes
+    peerConnection.oniceconnectionstatechange = () => {
+      console.log(`ICE connection state for ${viewerId}: ${peerConnection.iceConnectionState}`);
+    };
+    
+    peerConnection.onconnectionstatechange = () => {
+      console.log(`Connection state for ${viewerId}: ${peerConnection.connectionState}`);
+      
+      // Handle disconnections
+      if (peerConnection.connectionState === 'disconnected' || 
+          peerConnection.connectionState === 'failed' ||
+          peerConnection.connectionState === 'closed') {
+        
+        if (peerConnectionsRef.current[viewerId]) {
+          peerConnectionsRef.current[viewerId].close();
+          delete peerConnectionsRef.current[viewerId];
+          
+          // Update viewer count
+          setViewerCount(prevCount => Math.max(0, prevCount - 1));
+        }
+      }
+    };
+    
+    return peerConnection;
+  };
+  
   // Stop the broadcasting session
   const stopStreaming = () => {
-    // Stop sending frames
-    stopSendingFrames();
+    // Close all peer connections
+    Object.values(peerConnectionsRef.current).forEach(pc => {
+      pc.close();
+    });
+    peerConnectionsRef.current = {};
     
     // Close WebSocket connection
     if (socketRef.current) {
@@ -114,10 +232,10 @@ const Broadcaster = () => {
       socketRef.current = null;
     }
     
-    // Stop video stream
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
+    // Stop local media stream
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
     }
     
     // Reset video element
@@ -128,102 +246,6 @@ const Broadcaster = () => {
     setIsStreaming(false);
     setStatus('Stream ended');
     setViewerCount(0);
-    viewers.current.clear();
-  };
-  
-  // Start sending video frames
-  const startSendingFrames = () => {
-    console.log(`Starting to send frames at ${fps} FPS with quality ${quality}`);
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    const context = canvas.getContext('2d');
-    
-    // Calculate frame interval based on FPS
-    const frameInterval = 1000 / fps;
-    
-    // Set canvas dimensions to match video
-    if (video) {
-      const [width, height] = resolution.split('x').map(Number);
-      canvas.width = width;
-      canvas.height = height;
-    }
-    
-    // Function to capture and send a frame
-    const captureAndSendFrame = () => {
-      if (!video || !canvas || !context || !socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
-        console.log('Cannot send frame - video or WebSocket not ready');
-        return;
-      }
-      
-      try {
-        // Draw the current video frame to the canvas
-        context.drawImage(video, 0, 0, canvas.width, canvas.height);
-        
-        // Get the frame as a data URL
-        const frameDataUrl = canvas.toDataURL('image/jpeg', quality);
-        
-        // Check frame size to avoid huge payloads
-        const frameSize = frameDataUrl.length;
-        
-        if (frameSize > 100000) {
-          console.warn(`Large frame size: ${(frameSize/1024).toFixed(1)}KB - consider reducing quality/resolution`);
-        }
-        
-        // Send the frame through WebSocket
-        socketRef.current.send(JSON.stringify({
-          type: 'video_frame',
-          frame: frameDataUrl,
-          broadcaster_id: broadcasterId.current
-        }));
-        
-      } catch (error) {
-        console.error('Error sending frame:', error);
-      }
-    };
-    
-    // Start the frame sending interval
-    frameIntervalRef.current = setInterval(captureAndSendFrame, frameInterval);
-  };
-  
-  // Stop sending video frames
-  const stopSendingFrames = () => {
-    if (frameIntervalRef.current) {
-      clearInterval(frameIntervalRef.current);
-      frameIntervalRef.current = null;
-    }
-  };
-  
-  // Get video constraints based on selected resolution
-  const getResolutionConstraints = () => {
-    const [width, height] = resolution.split('x').map(Number);
-    return {
-      width: { ideal: width },
-      height: { ideal: height }
-    };
-  };
-  
-  // Handle quality change
-  const handleQualityChange = (e) => {
-    const newQuality = parseFloat(e.target.value);
-    setQuality(newQuality);
-    
-    // Update frame sending if already streaming
-    if (isStreaming) {
-      stopSendingFrames();
-      startSendingFrames();
-    }
-  };
-  
-  // Handle FPS change
-  const handleFpsChange = (e) => {
-    const newFps = parseInt(e.target.value, 10);
-    setFps(newFps);
-    
-    // Update frame sending if already streaming
-    if (isStreaming) {
-      stopSendingFrames();
-      startSendingFrames();
-    }
   };
   
   // Handle resolution change
@@ -255,12 +277,6 @@ const Broadcaster = () => {
             Camera preview will appear here when streaming starts
           </div>
         )}
-        
-        {/* Hidden canvas used for frame capture */}
-        <canvas 
-          ref={canvasRef} 
-          style={{ display: 'none' }}
-        />
       </div>
       
       <div className="settings-panel">
@@ -277,29 +293,6 @@ const Broadcaster = () => {
             <option value="640x480">640x480 (Medium)</option>
             <option value="1280x720">1280x720 (HD)</option>
           </select>
-        </div>
-        
-        <div className="setting">
-          <label>Quality: {quality.toFixed(1)}</label>
-          <input 
-            type="range" 
-            min="0.1" 
-            max="1" 
-            step="0.1" 
-            value={quality}
-            onChange={handleQualityChange}
-          />
-        </div>
-        
-        <div className="setting">
-          <label>FPS: {fps}</label>
-          <input 
-            type="range" 
-            min="1" 
-            max="30" 
-            value={fps}
-            onChange={handleFpsChange}
-          />
         </div>
       </div>
       
